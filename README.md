@@ -38,17 +38,26 @@ node tests/make-test-dicom.mjs out-dir    # writes an oblique test DICOM series 
 
 Joint vector `q = [L1 … L6, d]`: L1–L6 are the leg lengths (mm, base ball-joint centre to platform ball-joint centre) and `d` is the insertion depth (mm).
 
-## Entering the real Stormram 1 geometry
+## Stormram 1 geometry: status
 
-The geometry in `js/robots/stormram1.js` is **provisional**: it was estimated from photographs. To make it exact, enter:
+`js/robots/stormram1.js` documents where each number comes from.
 
-1. `hexapod.baseJoints`: the 6 base ball-joint centres in the robot base frame.
-2. `hexapod.platformJoints`: the 6 platform ball-joint centres in the platform frame, plus `homePlatform` (where the platform sits at home).
-3. `legMin` / `legMax`: the leg lengths at each end of the rack stroke.
-4. The ball-joint cone axes and maximum angles.
-5. `needle.origin` / `needle.dir` / `needle.max`: the insertion axis and stroke.
-6. `motors`: step size (mm) and maximum step frequency.
-7. `biopsy`: needle throw and notch dimensions of the biopsy gun used.
+**From CAD:**
+- The six base ball joints. They sit on a 100 mm radius every 60°, as in the base plate drawing (`Delrin_6mm_base_plate_round.cdr`), and the SolidWorks frame model (`Stormram1_frame_step.STEP`) agrees exactly.
+- The 10° tilted base cups.
+- The rack, motor and ball dimensions, and which platform ball each leg connects to.
+- The base plate outline and holes, in `js/robots/stormram1BasePlate.js`.
+
+**Still provisional:**
+- The platform ball positions (the STEP mounts are known to be wrong).
+- The home pose.
+- The leg stroke limits (estimated as 90–185 mm from the rack and motor geometry).
+- The ball-joint angle limits.
+- The needle axis and stroke.
+- The motor step size and step frequency.
+- The biopsy gun's throw and notch dimensions.
+
+`tools/cdr_contours.py` converts CorelDRAW laser-cutting drawings into contours in mm, with holes detected as circles. It needs `cdr2xhtml` from libcdr (`apt install libcdr-tools`).
 
 ### CAD meshes
 
@@ -65,7 +74,9 @@ js/core/la.js              small linear-algebra library (plain arrays; runs in b
 js/robots/stewart.js       generic Gough-Stewart IK / Newton FK / Jacobian / joint limits
 js/robots/hexapodRobot.js  hexapod + insertion axis: needle kinematics, trajectory planning, quantisation
 js/robots/hexapodVisual.js three.js rendering, CAD part loading
-js/robots/stormram1.js     Stormram 1 parameters
+js/robots/stormram1.js     Stormram 1 parameters (sources documented in the file)
+js/robots/stormram1BasePlate.js  base plate outline and holes, generated from the CorelDRAW file
+tools/cdr_contours.py      CorelDRAW (.cdr) drawing → contours in mm
 js/robots/registry.js      list of robots (Stormram 2/3, Sunram 5/7 etc. are placeholders)
 js/imaging/                volume model, DICOM loader, synthetic phantom
 js/ui/sliceViews.js        2D reformatted views with overlays

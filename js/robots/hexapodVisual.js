@@ -19,6 +19,7 @@ const COLORS = {
   notch: 0xff9a2e,
 };
 
+const DEG = Math.PI / 180;
 const mat = (color, opts = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.02, ...opts });
 
 function setMatrixFromPose(obj, T) {
@@ -74,35 +75,28 @@ export class HexapodVisual {
 
     // --- Base -----------------------------------------------------------------------------------
     const base = this.addBody('base', this.root);
-    const plate = new THREE.Mesh(new THREE.CylinderGeometry(v.basePlateRadius, v.basePlateRadius, v.basePlateThickness, 64), this.materials.plastic);
-    plate.rotation.x = Math.PI / 2;
-    plate.position.z = -v.basePlateThickness / 2;
-    base.procedural.add(plate);
-    for (let k = 0; k < 3; k++) {
-      const a = (k * 120 + 0) * Math.PI / 180;
+    base.procedural.add(this.makeBasePlate(v));
+    const ft = v.feet || { azimuths: [0, 120, 240], radius: v.basePlateRadius * 0.62, width: 48, thickness: 8, height: v.footHeight };
+    for (const az of ft.azimuths) {
+      // Two slotted fins forming a cross, as cut from the plate drawing.
+      const a = az * DEG;
       const foot = new THREE.Group();
-      const r = v.basePlateRadius * 0.62;
-      foot.position.set(r * Math.cos(a), r * Math.sin(a), -v.basePlateThickness);
+      foot.position.set(ft.radius * Math.cos(a), ft.radius * Math.sin(a), -v.basePlateThickness);
       foot.rotation.z = a;
-      const finA = zBox(48, 8, -v.footHeight, 0, this.materials.plastic);
-      const finB = zBox(8, 48, -v.footHeight, 0, this.materials.plastic);
-      foot.add(finA, finB);
+      foot.add(zBox(ft.width, ft.thickness, -ft.height, 0, this.materials.plastic));
+      foot.add(zBox(ft.thickness, ft.width, -ft.height, 0, this.materials.plastic));
       base.procedural.add(foot);
     }
+    const cupR = v.baseCupRadius ?? 26;
     kin.b.forEach((b, i) => {
-      // Ball-joint housing: a tilted cup centred on the base joint, aligned with the home leg direction.
-      const cup = new THREE.Mesh(new THREE.CylinderGeometry(26, 30, 26, 32, 1, true), this.materials.joint);
+      // Ball-joint housing: a spherical band around the ball, tilted along the cup axis.
       const g = new THREE.Group();
-      setMatrixFromPose(g, { p: b, R: rotBetween([0, 0, 1], this.homeDirs[i]) });
-      cup.rotation.x = Math.PI / 2;
-      cup.position.z = -8;
-      const flange = new THREE.Mesh(new THREE.CylinderGeometry(38, 38, 6, 32), this.materials.joint);
-      const fg = new THREE.Group();
-      fg.position.set(b[0], b[1], 3);
-      flange.rotation.x = Math.PI / 2;
-      fg.add(flange);
-      g.add(cup);
-      base.procedural.add(g, fg);
+      setMatrixFromPose(g, { p: b, R: rotBetween([0, 1, 0], kin.baseAxes[i]) });
+      g.add(new THREE.Mesh(new THREE.SphereGeometry(cupR, 32, 16, 0, Math.PI * 2, 0.9, 1.0), this.materials.joint));
+      const flange = new THREE.Mesh(new THREE.CylinderGeometry(cupR + 10, cupR + 10, 4, 32), this.materials.joint);
+      flange.position.y = -2;
+      g.add(flange);
+      base.procedural.add(g);
     });
 
     // --- Legs -----------------------------------------------------------------------------------
@@ -116,7 +110,7 @@ export class HexapodVisual {
         const band = zBox(w + 0.6, h + 0.6, v.motorOffset + s * len / 5 - 0.4, v.motorOffset + s * len / 5 + 0.4, mat(COLORS.plasticDark));
         motor.procedural.add(band);
       }
-      const ball = new THREE.Mesh(new THREE.SphereGeometry(16, 24, 16), this.materials.joint);
+      const ball = new THREE.Mesh(new THREE.SphereGeometry(v.baseBallRadius ?? 16, 24, 16), this.materials.joint);
       motor.procedural.add(ball);
       const label = labelSprite(String(i + 1));
       label.position.set(w / 2 + 2, 0, v.motorOffset + len / 2 + 6);
@@ -124,8 +118,9 @@ export class HexapodVisual {
 
       const rack = this.addBody(`rack${i + 1}`, this.root);
       const rackMat = mat(COLORS.rack);
-      rack.procedural.add(zBox(v.rackSection[0], v.rackSection[1], -v.rackLength, -6, rackMat));
-      const pball = new THREE.Mesh(new THREE.SphereGeometry(11, 20, 14), this.materials.joint);
+      const top = v.rackTopOffset ?? 6;
+      rack.procedural.add(zBox(v.rackSection[0], v.rackSection[1], -top - v.rackLength, -top, rackMat));
+      const pball = new THREE.Mesh(new THREE.SphereGeometry(v.platformBallRadius ?? 11, 20, 14), this.materials.joint);
       rack.procedural.add(pball);
       return { motor, rack, motorMat, rackMat };
     });
@@ -133,19 +128,26 @@ export class HexapodVisual {
     // --- Platform -------------------------------------------------------------------------------
     const platform = this.addBody('platform', this.root);
     this.platform = platform;
-    const pts = kin.a.map((a) => [a[0], a[1]]).sort((p, q) => Math.atan2(p[1], p[0]) - Math.atan2(q[1], q[0]));
     const shape = new THREE.Shape();
-    pts.forEach(([x, y], i) => {
-      const r = Math.hypot(x, y), k = (r + 22) / r;
-      i === 0 ? shape.moveTo(x * k, y * k) : shape.lineTo(x * k, y * k);
-    });
+    if (v.platformRect) {
+      const [x0, x1, y0, y1] = v.platformRect;
+      shape.moveTo(x0, y0); shape.lineTo(x1, y0); shape.lineTo(x1, y1); shape.lineTo(x0, y1);
+    } else {
+      const pts = kin.a.map((a) => [a[0], a[1]]).sort((p, q) => Math.atan2(p[1], p[0]) - Math.atan2(q[1], q[0]));
+      pts.forEach(([x, y], i) => {
+        const r = Math.hypot(x, y), k = (r + 22) / r;
+        i === 0 ? shape.moveTo(x * k, y * k) : shape.lineTo(x * k, y * k);
+      });
+    }
     shape.closePath();
     const plat = new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: v.platformThickness, bevelEnabled: false }), this.materials.plastic);
     platform.procedural.add(plat);
     kin.a.forEach((a) => {
-      const cup = new THREE.Mesh(new THREE.CylinderGeometry(15, 15, v.platformJointCupHeight, 24), this.materials.joint);
+      // Mount from the platform underside down to the ball cup.
+      const r = v.platformCupRadius ?? 15;
+      const cup = new THREE.Mesh(new THREE.CylinderGeometry(r, r, Math.abs(a[2]), 24), this.materials.joint);
       cup.rotation.x = Math.PI / 2;
-      cup.position.set(a[0], a[1], (a[2] + 0) / 2);
+      cup.position.set(a[0], a[1], a[2] / 2);
       platform.procedural.add(cup);
     });
     // Insertion stage: a stack of laser-cut plates carrying the rail along the needle axis.
@@ -195,6 +197,29 @@ export class HexapodVisual {
     this.fireOffset = 0;
 
     this.cadLoaded = {};
+  }
+
+  /** Base plate: the laser-cut outline with its holes when available, else a disc. */
+  makeBasePlate(v) {
+    const t = v.basePlateThickness;
+    let geom;
+    if (v.basePlate) {
+      const P = v.basePlate;
+      const shape = new THREE.Shape(P.outline.map(([x, y]) => new THREE.Vector2(x, y)));
+      for (const [x, y, r] of P.circles) {
+        const h = new THREE.Path();
+        h.absarc(x, y, r, 0, Math.PI * 2, true);
+        shape.holes.push(h);
+      }
+      for (const poly of P.slots) shape.holes.push(new THREE.Path(poly.map(([x, y]) => new THREE.Vector2(x, y))));
+      geom = new THREE.ExtrudeGeometry(shape, { depth: t, bevelEnabled: false, curveSegments: 16 });
+      geom.translate(0, 0, -t);
+    } else {
+      geom = new THREE.CylinderGeometry(v.basePlateRadius, v.basePlateRadius, t, 64);
+      geom.rotateX(Math.PI / 2);
+      geom.translate(0, 0, -t / 2);
+    }
+    return new THREE.Mesh(geom, this.materials.plastic);
   }
 
   addBody(name, parent) {

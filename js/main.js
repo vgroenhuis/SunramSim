@@ -341,13 +341,15 @@ class App {
     const up = this.state.roomUp;
     const vol = this.state.volume;
     const center = vol ? vol.center : [0, 0, 0];
-    // Needle (+x of the base) points horizontally; prefer the patient's left-right axis.
+    // The home needle direction points horizontally; prefer the patient's left-right axis.
     let xr = [1, 0, 0];
     if (Math.abs(dot(xr, up)) > 0.9) xr = [0, 0, 1];
     xr = normalize(sub(xr, scale(up, dot(xr, up))));
     const zr = up, yr = cross(zr, xr);
-    const R = transpose([xr, yr, zr]);
-    const tip0 = this.robot.needleInBase(this.robot.homePlatform, 0).tip0;
+    const home = this.robot.needleInBase(this.robot.homePlatform, 0);
+    const az = Math.atan2(home.dir[1], home.dir[0]);
+    const R = mulMM(transpose([xr, yr, zr]), rotZ(-az));
+    const tip0 = home.tip0;
     let standoff = 40;
     if (vol) {
       const b = vol.bounds();
