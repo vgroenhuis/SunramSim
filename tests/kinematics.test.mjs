@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createStormram1 } from '../js/robots/stormram1.js';
-import { fromRPY, mulMM, dist, DEG, norm, sub, dot } from '../js/core/la.js';
+import { fromRPY, mulMM, mulMV, rotZ, dist, DEG, norm, sub, dot } from '../js/core/la.js';
 import { HexapodNeedleRobot } from '../js/robots/hexapodRobot.js';
 
 const robot = createStormram1();
@@ -31,8 +31,10 @@ test('FK inverts IK over random poses', () => {
 
 test('needle planning reaches the target along the requested direction', () => {
   const home = robot.fk(robot.homeJoints());
-  const target = [home.tip0[0] + 40, home.tip0[1] + 15, home.tip0[2] - 10];
-  const dir = [Math.cos(10 * DEG), Math.sin(10 * DEG), -0.1];
+  // Target ahead of the retracted tip, slightly off the home axis; direction rotated 8° about z.
+  const side = [-home.dir[1], home.dir[0], 0];
+  const target = home.tip0.map((v, i) => v + 40 * home.dir[i] + 8 * side[i] - (i === 2 ? 5 : 0));
+  const dir = mulMV(rotZ(8 * DEG), home.dir).map((v, i) => v - (i === 2 ? 0.05 : 0));
   const plan = robot.planNeedle(target, dir);
   assert.ok(plan.ok, JSON.stringify(plan.violations));
   const fk = robot.fk(plan.q, robot.homePlatform);

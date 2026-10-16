@@ -2,65 +2,81 @@
 // stepper motors (each pivoting in a ball joint on the base, its rack ending in a ball joint under
 // the platform) plus a seventh stepper on the platform that drives the biopsy needle forward.
 //
-// GEOMETRY IS PROVISIONAL: the joint coordinates below are estimated from photographs and must be
-// replaced by the CAD values. Everything is in millimetres in the robot base frame:
-//   origin = centre of the top surface of the base plate, +z up, +x = default needle direction.
+// Robot base frame (mm): origin = centre of the top surface of the base plate, +z up, x/y as in the
+// laser-cutting drawing of the base plate (Delrin_6mm_base_plate_round.cdr).
+//
+// Sources:
+//   - Base ball joints: the six Ø46 housing holes of the base plate drawing (r = 100 mm, every 60°)
+//     and the SolidWorks frame model (Stormram1_frame_step.STEP), which agree exactly. Ball centre
+//     height above the plate and the 10° tilted cups are taken from the STEP model.
+//   - Leg hardware (rack 130.1 mm, rack end 11.1 mm below the platform ball, motor 34–64 mm from the
+//     base ball, R20 / R7.5 balls), the 100 × 150 × 6 mm platform grid and the leg-to-platform
+//     connectivity: STEP model.
+// PROVISIONAL (to be confirmed): platform ball positions (the STEP mounts are known to be wrong),
+// home pose, stroke limits, ball-joint angle limits, needle axis and motor step size/frequency.
 
-import { DEG, sub, normalize, I3 } from '../core/la.js';
+import { DEG, I3, rotZ, mulMV, sub, normalize } from '../core/la.js';
 import { HexapodNeedleRobot } from './hexapodRobot.js';
+import { STORMRAM1_BASE_PLATE } from './stormram1BasePlate.js';
 
-const BASE_RADIUS = 115;      // radius of the circle through the base ball-joint centres
-const BASE_PAIR_HALF = 12;    // half the angular spacing within a base joint pair (deg)
-const BASE_Z = 30;            // base ball-joint centres above the base plate
-const PLAT_RADIUS = 75;       // radius of the circle through the platform ball-joint centres
-const PLAT_PAIR_HALF = 12;
-const PLAT_Z = -25;           // platform ball-joint centres below the platform frame origin
-const HOME_HEIGHT = 230;      // platform frame origin above the base frame origin at home
-const PAIR_OFFSET = 0;        // rotation of the whole pattern about z (deg)
+const BASE_BALL_Z = 1.0; // base ball centres above the plate top (STEP model; plate is 10 mm there)
 
-function circlePoint(r, angDeg, z) {
-  const a = angDeg * DEG;
-  return [r * Math.cos(a), r * Math.sin(a), z];
-}
+// Base ball centres, in leg order (leg i of the STEP model).
+const BASE_JOINTS = [-150, -30, -90, 30, 90, 150].map((a) => [
+  100 * Math.cos(a * DEG), 100 * Math.sin(a * DEG), BASE_BALL_Z,
+]);
 
-function buildJoints() {
-  const base = [], plat = [];
-  for (let k = 0; k < 3; k++) {
-    const c = 120 * k + PAIR_OFFSET + 60; // base pairs at 60, 180, 300 deg: needle side (+x) stays open
-    // Leg 2k connects base (c + half) to platform (c + 60 - half); leg 2k+1 connects base
-    // (c - half) to platform (c - 60 + half): the classic crossed 6-6 arrangement.
-    base.push(circlePoint(BASE_RADIUS, c + BASE_PAIR_HALF, BASE_Z));
-    plat.push(circlePoint(PLAT_RADIUS, c + 60 - PLAT_PAIR_HALF, PLAT_Z));
-    base.push(circlePoint(BASE_RADIUS, c - BASE_PAIR_HALF, BASE_Z));
-    plat.push(circlePoint(PLAT_RADIUS, c - 60 + PLAT_PAIR_HALF, PLAT_Z));
-  }
-  return { base, plat };
-}
+// Platform ball centres in the platform frame (origin = underside centre of the grid plate, +x along
+// its 150 mm side, +z up). From the STEP model, which places them on the 2.5 mm mounting grid.
+const PLATFORM_JOINTS = [
+  [60, -17.5, -16.5],
+  [32.5, 35, -16.5],
+  [57.5, 25, -16.5],
+  [-60, 32.5, -16.5],
+  [-60, 7.5, -16.5],
+  [32.5, -35, -16.5],
+];
+
+// Home: platform level, at the yaw of the STEP model, its ball centroid above the base centre.
+const HOME_YAW = -150;
+const HOME_HEIGHT = 136;
+
+const CUP_TILT = 10; // base cups are tilted 10° from vertical (STEP model)
 
 export const stormram1Config = (() => {
-  const { base, plat } = buildJoints();
-  const homeP = [0, 0, HOME_HEIGHT];
-  // Ball-joint cones are centred on the home leg direction (the sockets are mounted tilted).
-  const homeDirs = base.map((b, i) => normalize(sub([plat[i][0] + homeP[0], plat[i][1] + homeP[1], plat[i][2] + homeP[2]], b)));
+  const R = rotZ(HOME_YAW * DEG);
+  const c = PLATFORM_JOINTS.reduce((s, a) => [s[0] + a[0] / 6, s[1] + a[1] / 6, 0], [0, 0, 0]);
+  const rc = mulMV(R, c);
+  const homeP = [-rc[0], -rc[1], HOME_HEIGHT];
+  // Tilt each base cup towards its leg's home direction.
+  const cupAxes = BASE_JOINTS.map((b, i) => {
+    const P = sub([...mulMV(R, PLATFORM_JOINTS[i])].map((v, k) => v + homeP[k]), b);
+    const az = Math.atan2(P[1], P[0]);
+    const t = CUP_TILT * DEG;
+    return normalize([Math.sin(t) * Math.cos(az), Math.sin(t) * Math.sin(az), Math.cos(t)]);
+  });
   return {
     id: 'stormram1',
     name: 'Stormram 1',
     year: 2016,
     description: '7-DOF hexapod with needle insertion, actuated by seven pneumatic linear stepper motors.',
     provisional: true,
+    provisionalNote: 'Base geometry is from the CAD files; platform ball positions, home pose, stroke limits and the needle axis are still provisional.',
     hexapod: {
-      baseJoints: base,
-      platformJoints: plat,
-      legMin: 150,
-      legMax: 245,
-      baseJointAxes: homeDirs,
-      platformJointAxes: homeDirs.map((d) => [-d[0], -d[1], -d[2]]),
-      baseJointMaxAngle: 35,
-      platformJointMaxAngle: 35,
+      baseJoints: BASE_JOINTS,
+      platformJoints: PLATFORM_JOINTS,
+      // Estimated: shortest when the rack cup reaches the motor (~85 mm), longest when the rack end
+      // approaches the pinion inside the motor (STEP pose reaches 180.6 mm).
+      legMin: 90,
+      legMax: 185,
+      baseJointAxes: cupAxes,
+      platformJointAxes: PLATFORM_JOINTS.map(() => [0, 0, -1]),
+      baseJointMaxAngle: 40,
+      platformJointMaxAngle: 50,
     },
-    homePlatform: { p: homeP, R: I3() },
+    homePlatform: { p: homeP, R },
     needle: {
-      origin: [150, 0, 95], // needle tip at zero insertion, platform frame
+      origin: [150, 0, 95], // needle tip at zero insertion, platform frame (estimated)
       dir: [1, 0, 0],
       min: 0,
       max: 70,
@@ -78,15 +94,22 @@ export const stormram1Config = (() => {
       notchLength: 18,        // specimen notch length (mm)
     },
     visual: {
-      basePlateRadius: 160,
-      basePlateThickness: 10,
-      footHeight: 160,
-      platformThickness: 10,
-      platformJointCupHeight: 22,
-      motorSize: [62, 62, 48], // across, across, along leg
-      motorOffset: 22,         // motor body centre from base ball centre, along the leg
-      rackLength: 300,
-      rackSection: [9, 14],
+      basePlate: STORMRAM1_BASE_PLATE,
+      basePlateRadius: 133,
+      basePlateThickness: 6,
+      footHeight: 120,
+      feet: { azimuths: [0, 120, 240], radius: 80, width: 50, thickness: 6, height: 120 },
+      platformRect: [-75, 75, -50, 50],
+      platformThickness: 6,
+      baseBallRadius: 20,
+      baseCupRadius: 23,
+      platformBallRadius: 7.5,
+      platformCupRadius: 10.5,
+      motorSize: [80, 40, 28], // across, across, along leg
+      motorOffset: 48.8,       // motor body centre from base ball centre, along the leg
+      rackLength: 130.1,
+      rackTopOffset: 11.1,     // rack end below the platform ball centre, along the leg
+      rackSection: [4.1, 12.5],
       gunLength: 150,
       gunRadius: 12,
     },
@@ -94,11 +117,7 @@ export const stormram1Config = (() => {
     // configuration. `cadToBase` maps CAD assembly coordinates to the robot base frame.
     cad: {
       cadToBase: { p: [0, 0, 0], R: I3() },
-      parts: {
-        // base: 'models/stormram1/base.stl',
-        // platform: 'models/stormram1/platform.stl',
-        // motor1..motor6, rack1..rack6, needle: ...
-      },
+      parts: {},
     },
   };
 })();
