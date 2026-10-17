@@ -2,13 +2,31 @@
 
 A browser-based simulator for the Stormram/Sunram family of MRI-guided biopsy robots. It currently models **Stormram 1**: a 7-DOF robot made of a pneumatic hexapod plus a needle-insertion stage.
 
-What it does:
+The app opens with just the robot and a **Get started** panel that walks you through a biopsy:
+add an MRI scan, choose a target, position the robot, plan the needle path and perform the biopsy.
+All other panels (MRI scan, Robot, Joint control, End-effector pose, Biopsy, Help) start collapsed.
+
+Buttons in the 3D view control objects directly:
+- **Enable robot position gimbal** (at the robot base): move and rotate the whole robot.
+- **Enable joint control** (between base and platform): sliders for each motor.
+- **Enable end-effector gimbal** (at the needle tip): move and rotate the needle tip; inverse
+  kinematics rejects poses the robot cannot reach and names the limiting joints.
+- **Enable gimbal** and **View settings** (at the scan): move and rotate the scan, and adjust
+  brightness, contrast and slice positions. The full settings stay in the MRI scan panel.
+
+With a mouse a gimbal shows its move arrows and rotation rings together; on touch screens it shows
+one at a time, with a button to switch. Esc turns the gimbal off.
+
+Features:
 
 - **Joint control**: the six leg lengths and the insertion depth, optionally snapped to the motor step size.
-- **End-effector control**: inverse kinematics for the needle-tip pose, using sliders or a 3D handle that rotates about the needle tip. If a pose can't be reached, it names the limiting joints.
-- **Image data**: load a DICOM series (files, folder, or drag-and-drop) or use the built-in synthetic prone breast phantom. The scan shows as axial, coronal, sagittal and needle-aligned slices, and as planes in the 3D view.
-- **Robot placement**: position the robot base relative to the patient, either with the handle, by typing values, or with *Place robot for target*.
-- **Biopsy workflow**: pick a target (and optionally an entry point), plan the trajectory, then **Align → Insert → Fire → Retract**. Moves run at the motor step rate. After firing, it reports how well the specimen notch lines up with the target.
+- **End-effector control**: inverse kinematics for the needle-tip pose, by sliders or the gimbal.
+- **Image data**: a DICOM series (files, folder, or drag-and-drop) or the built-in synthetic prone
+  breast phantom, shown as slice planes in 3D and in a dock with axial, coronal, sagittal and
+  needle-aligned views.
+- **Biopsy workflow**: pick a target (and optionally an entry point), plan the trajectory, then
+  **Align → Insert → Fire → Retract**. Moves run at the motor step rate. After firing, it reports
+  how well the specimen notch lines up with the target.
 
 ## Running
 
@@ -31,8 +49,9 @@ node tests/make-test-dicom.mjs out-dir    # writes an oblique test DICOM series 
 
 | Frame | Definition |
 |---|---|
-| World | DICOM patient frame **LPS**, mm. Room "up" depends on patient position (prone ⇒ +Y). |
-| Robot base | Origin at the centre of the base plate's top surface. +z is up, +x is the default needle direction. |
+| Room | The 3D scene, mm. "Up" depends on the patient position (prone ⇒ the scan's +Y). |
+| Scan | DICOM patient frame **LPS**, mm, placed in the room by the scan gimbal. Targets and plans live here. |
+| Robot base | Origin at the centre of the base plate's top surface, +z up; x/y as in the base plate drawing. |
 | Platform | Moving hexapod platform. The pose at home is `homePlatform` in the robot file. |
 | Needle | Tip at zero insertion (`needle.origin`, platform frame), moving along `needle.dir`. |
 
@@ -80,6 +99,7 @@ tools/cdr_contours.py      CorelDRAW (.cdr) drawing → contours in mm
 js/robots/registry.js      list of robots (Stormram 2/3, Sunram 5/7 etc. are placeholders)
 js/imaging/                volume model, DICOM loader, synthetic phantom
 js/ui/sliceViews.js        2D reformatted views with overlays
+js/ui/gimbal.js            combined move/rotate manipulator
 js/main.js                 application
 ```
 

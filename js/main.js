@@ -1,22 +1,27 @@
 // SunramSim application: 3D scene, robot control, image views and the biopsy workflow.
-// World coordinates are the DICOM patient frame (LPS, mm). The robot base pose is expressed in it.
+//
+// Frames: the 3D scene is in a room ("world") frame, mm, whose up direction is state.roomUp.
+// The robot base sits in the room at `robotWorld`; an MRI scan (DICOM patient frame, LPS, mm) is
+// placed in the room at `volumePose`. Imaging, targets and plans are kept in LPS; `basePose` is
+// the robot base expressed in LPS, which is what the kinematics and planning use.
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
   add, sub, scale, dot, cross, norm, normalize, dist, mulMV, mulMM, transpose, fromRPY, toRPY, rotZ, rotY,
-  poseToMatrix4Array, applyPose, invertPose, composePose, DEG,
+  poseToMatrix4Array, applyPose, invertPose, composePose, I3, DEG,
 } from './core/la.js';
 import { ROBOTS } from './robots/registry.js';
 import { HexapodNeedleRobot } from './robots/hexapodRobot.js';
 import { createBreastPhantom } from './imaging/phantom.js';
 import { readDicomFiles, filesFromDataTransfer } from './imaging/dicom.js';
 import { SliceView } from './ui/sliceViews.js';
+import { Gimbal } from './ui/gimbal.js';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (v, n = 1) => (Math.abs(v) < 0.5 * 10 ** -n ? 0 : v).toFixed(n);
 const fmtV = (v, n = 1) => `(${v.map((x) => fmt(x, n).padStart(7)).join(',')})`;
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function setStatus(msg, bad = false) {
   const el = $('status');
@@ -40,6 +45,37 @@ function setObjectPose(obj, T) {
   m.decompose(obj.position, obj.quaternion, obj.scale);
   obj.updateMatrixWorld(true);
 }
+function setGroupMatrix(obj, T) {
+  obj.matrixAutoUpdate = false;
+  obj.matrix.fromArray(poseToMatrix4Array(T));
+  obj.matrixWorldNeedsUpdate = true;
+}
+
+/** An HTML element pinned next to a point of the 3D scene. */
+class Anchor {
+  constructor(parent, { className = 'anchor', offset = [12, -12], point }) {
+    this.el = document.createElement('div');
+    this.el.className = className;
+    parent.appendChild(this.el);
+    this.offset = offset;
+    this.point = point; // () => world point [x, y, z] or null
+    this.screen = null;
+  }
+
+  update(camera, w, h) {
+    const p = this.point();
+    if (!p) { this.el.style.display = 'none'; this.screen = null; return; }
+    const v = new THREE.Vector3(...p).project(camera);
+    if (v.z > 1 || v.z < -1) { this.el.style.display = 'none'; this.screen = null; return; }
+    this.el.style.display = '';
+    const x = (v.x + 1) / 2 * w + this.offset[0], y = (1 - v.y) / 2 * h + this.offset[1];
+    this.screen = [x, y];
+    const r = this.el.getBoundingClientRect();
+    // Keep the element inside the view.
+    const cx = Math.min(Math.max(x, 4), w - r.width - 4), cy = Math.min(Math.max(y, 4), h - r.height - 4);
+    this.el.style.transform = `translate(${cx}px, ${cy}px)`;
+  }
+}
 
 class App {
   constructor() {
@@ -56,6 +92,10 @@ class App {
       roomUp: [0, 1, 0],
       fire: 0,
     };
+    this.robotWorld = { p: [0, 0, 0], R: I3() };
+    this.volumePose = { p: [0, 0, 0], R: I3() };
+    this.robotPlaced = false;     // has the user positioned the robot (guide step)?
+    this.activeGimbal = null;     // 'base' | 'tip' | 'volume' | null
     this.pickMode = 'cursor';
     this.dirty = true;
     this.motion = null;
@@ -63,10 +103,20 @@ class App {
     this.initScene();
     this.initViews();
     this.initUI();
+    this.initOverlays();
     this.loadRobot('stormram1');
-    this.loadPhantom();
+    this.frameCamera();
+    this.updateGuide();
     this.loop();
   }
+
+  /** Robot base pose in the scan (LPS) frame. */
+  get basePose() { return composePose(invertPose(this.volumePose), this.robotWorld); }
+
+  /** The room's up direction expressed in the scan frame. */
+  upInPatient() { return mulMV(transpose(this.volumePose.R), this.state.roomUp); }
+
+  lpsToWorld(x) { return applyPose(this.volumePose, x); }
 
   // ---------------------------------------------------------------- scene ---------------------
   initScene() {
@@ -74,7 +124,7 @@ class App {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setClearColor(0x22262c);
-    el.appendChild(this.renderer.domElement);
+    el.prepend(this.renderer.domElement);
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(38, 1, 5, 20000);
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x3a3f46, 1.6));
@@ -90,38 +140,47 @@ class App {
     this.robotRoot.matrixAutoUpdate = false;
     this.scene.add(this.robotRoot);
 
+    // Everything expressed in the scan (LPS) frame lives in patientGroup.
+    this.patientGroup = new THREE.Group();
+    this.patientGroup.matrixAutoUpdate = false;
+    this.scene.add(this.patientGroup);
     this.volumeGroup = new THREE.Group();
-    this.scene.add(this.volumeGroup);
+    this.patientGroup.add(this.volumeGroup);
 
     const sphere = (color, r) => new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.9 }));
     this.targetMarker = sphere(0xff3b6b, 2.5);
     this.entryMarker = sphere(0x3ddc84, 2);
     this.targetMarker.renderOrder = this.entryMarker.renderOrder = 10;
     this.targetMarker.visible = this.entryMarker.visible = false;
-    this.scene.add(this.targetMarker, this.entryMarker);
+    this.patientGroup.add(this.targetMarker, this.entryMarker);
     this.planLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineDashedMaterial({ color: 0x00e6c8, dashSize: 6, gapSize: 4, depthTest: false, transparent: true }));
     this.planLine.renderOrder = 9;
     this.planLine.visible = false;
-    this.scene.add(this.planLine);
+    this.patientGroup.add(this.planLine);
     this.coreMesh = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.4, 1, 12), new THREE.MeshBasicMaterial({ color: 0xff7a28, depthTest: false, transparent: true, opacity: 0.85 }));
     this.coreMesh.renderOrder = 11;
     this.coreMesh.visible = false;
-    this.scene.add(this.coreMesh);
+    this.patientGroup.add(this.coreMesh);
 
-    // Handles for the 3D manipulator.
-    this.tipHandle = new THREE.Object3D();
-    this.baseHandle = new THREE.Object3D();
-    this.scene.add(this.tipHandle, this.baseHandle);
+    // Objects the gimbal manipulates (room frame).
+    this.handles = { base: new THREE.Object3D(), tip: new THREE.Object3D(), volume: new THREE.Object3D() };
+    this.scene.add(...Object.values(this.handles));
 
     this.resize3D = () => {
       const r = el.getBoundingClientRect();
       this.renderer.setSize(r.width, r.height);
       this.camera.aspect = r.width / Math.max(1, r.height);
       this.camera.updateProjectionMatrix();
+      this.viewSize = [r.width, r.height];
     };
     new ResizeObserver(() => { this.resize3D(); this.requestRender(); }).observe(el);
     this.resize3D();
     this.makeControls();
+    this.gimbal = new Gimbal(this.camera, this.renderer.domElement, this.scene, {
+      onChange: () => this.onGimbalChange(),
+      onDragging: (d) => { this.orbit.enabled = !d; },
+      onRelease: () => this.syncHandles(),
+    });
   }
 
   makeControls() {
@@ -132,21 +191,14 @@ class App {
     this.orbit.target.copy(target);
     this.orbit.enableDamping = true;
     this.orbit.dampingFactor = 0.15;
-    if (!this.gizmo) {
-      this.gizmo = new TransformControls(this.camera, this.renderer.domElement);
-      this.gizmo.setSize(0.8);
-      this.scene.add(this.gizmo.getHelper());
-      this.gizmo.addEventListener('objectChange', () => this.onGizmoChange());
-      this.gizmo.addEventListener('mouseUp', () => this.onGizmoRelease());
-    }
-    this.gizmo.addEventListener('dragging-changed', (e) => { this.orbit.enabled = !e.value; });
   }
 
+  /** Fit the robot (and the scan, if any) in view, seen from the robot's side, slightly from above. */
   frameCamera() {
     const pts = [];
     const v = this.state.volume;
-    if (v) pts.push(...v.corners());
-    const base = this.basePose;
+    if (v) pts.push(...v.corners().map((c) => this.lpsToWorld(c)));
+    const base = this.robotWorld;
     const vis = this.robot.cfg.visual;
     for (const z of [-vis.footHeight, 380]) for (const a of [0, 90, 180, 270]) {
       pts.push(applyPose(base, [vis.basePlateRadius * Math.cos(a * DEG), vis.basePlateRadius * Math.sin(a * DEG), z]));
@@ -154,10 +206,11 @@ class App {
     const c = scale(pts.reduce((a, b) => add(a, b), [0, 0, 0]), 1 / pts.length);
     const r = Math.max(...pts.map((p) => dist(p, c)));
     const up = this.state.roomUp;
-    // View from the robot's side, slightly from above.
-    const side = normalize(sub(mulMV(base.R, [0, -1, 0]), scale(up, dot(mulMV(base.R, [0, -1, 0]), up))));
-    const along = normalize(cross(up, side));
-    const eye = add(c, scale(add(add(scale(side, 1.0), scale(up, 0.45)), scale(along, -0.35)), r * 1.9));
+    const needle = mulMV(base.R, this.robot.needleInBase(this.robot.homePlatform, 0).dir);
+    const fwd = normalize(sub(needle, scale(up, dot(needle, up))));
+    const side = normalize(cross(up, fwd));
+    // Look across the needle direction so the robot and the scan in front of it are side by side.
+    const eye = add(c, scale(add(add(scale(side, -1.0), scale(up, 0.5)), scale(fwd, -0.35)), r * 2.0 * Math.max(1, 1 / this.camera.aspect)));
     this.camera.position.set(...eye);
     this.orbit.target.set(...c);
     this.orbit.update();
@@ -187,6 +240,12 @@ class App {
 
   requestRender() { this.dirty = true; }
 
+  setSliceDock(open) {
+    const dock = $('sliceDock');
+    dock.classList.toggle('collapsed', !open);
+    this.requestRender();
+  }
+
   needleViewLine() {
     const s = this.state;
     if (s.plan) return { center: s.plan.target, dir: s.plan.dir };
@@ -210,8 +269,11 @@ class App {
 
   onWindowChanged() {
     const w = this.state.window;
-    $('wlCenter').value = w.center; $('wlWidth').value = w.width;
-    $('wlCenterOut').textContent = fmt(w.center, 0); $('wlWidthOut').textContent = fmt(w.width, 0);
+    for (const [c, wd, co, wo] of [['wlCenter', 'wlWidth', 'wlCenterOut', 'wlWidthOut'], ['pvCenter', 'pvWidth', 'pvCenterOut', 'pvWidthOut']]) {
+      if (!$(c)) continue;
+      $(c).value = w.center; $(wd).value = w.width;
+      $(co).textContent = fmt(w.center, 0); $(wo).textContent = fmt(w.width, 0);
+    }
     this.requestRender();
   }
 
@@ -222,20 +284,19 @@ class App {
     s.window = { ...vol.autoWindow };
     s.cursor = vol.center;
     const range = vol.max - vol.min;
-    for (const id of ['wlCenter', 'wlWidth']) {
-      $(id).min = id === 'wlWidth' ? 1 : vol.min;
-      $(id).max = id === 'wlWidth' ? range * 2 : vol.max;
-      $(id).step = range / 500;
+    for (const [c, w] of [['wlCenter', 'wlWidth'], ['pvCenter', 'pvWidth']]) {
+      $(c).min = vol.min; $(c).max = vol.max; $(c).step = range / 500;
+      $(w).min = 1; $(w).max = range * 2; $(w).step = range / 500;
     }
     this.onWindowChanged();
-    const pp = (vol.meta.patientPosition || '').toUpperCase();
-    const up = pp.endsWith('P') ? [0, 1, 0] : pp.endsWith('S') ? [0, -1, 0] : pp.includes('DL') ? [-1, 0, 0] : pp.includes('DR') ? [1, 0, 0] : s.roomUp;
-    $('roomUp').value = up.join(',');
-    this.setRoomUp(up, false);
     const b = vol.bounds();
     const fov = Math.max(...[0, 1, 2].map((a) => b[1][a] - b[0][a])) * 1.05;
     for (const v of Object.values(this.views)) { v.fov = v.kind === 'oblique' ? Math.min(fov, 200) : fov; v.pan = [0, 0]; v.offset = 0; }
-    $('volumeInfo').innerHTML = `<b>${vol.name}</b><br>${vol.dims.join(' × ')} voxels, ${vol.spacing.map((x) => x.toFixed(2)).join(' × ')} mm<br>${vol.meta.modality || ''} ${vol.meta.patientPosition ? `· position ${vol.meta.patientPosition}` : ''}`;
+    ['x', 'y', 'z'].forEach((k, a) => {
+      const el = $(`pvSlice${k}`);
+      el.min = b[0][a]; el.max = b[1][a]; el.step = Math.min(...vol.spacing);
+    });
+    $('volumeInfo').innerHTML = `<b>${esc(vol.name)}</b><br>${vol.dims.join(' × ')} voxels, ${vol.spacing.map((x) => x.toFixed(2)).join(' × ')} mm<br>${esc(vol.meta.modality || '')} ${vol.meta.patientPosition ? `· position ${esc(vol.meta.patientPosition)}` : ''}`;
     // Volume outline.
     if (this.volumeBox) this.volumeGroup.remove(this.volumeBox);
     const box = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: 0x6f7c8a }));
@@ -254,19 +315,50 @@ class App {
       btn.onclick = () => this.setTarget(L.center);
       lb.appendChild(btn);
     }
-    this.clearProcedure();
     s.target = null; s.entry = null;
+    // Patient position from the DICOM header decides which way is up in the room.
+    const pp = (vol.meta.patientPosition || '').toUpperCase();
+    const up = pp.endsWith('P') ? [0, 1, 0] : pp.endsWith('S') ? [0, -1, 0] : pp.includes('DL') ? [-1, 0, 0] : pp.includes('DR') ? [1, 0, 0] : s.roomUp;
+    $('roomUp').value = up.join(',');
+    if (up.join() !== s.roomUp.join()) this.setRoomUp(up);
+    this.placeVolumeInFront();
+    this.clearProcedure();
     this.updateTargetInfo();
-    this.resetBasePlacement();
+    $('sliceDock').classList.remove('hidden');
     this.frameCamera();
+    this.updateGuide();
     this.requestRender();
   }
 
-  setRoomUp(up, reframe = true) {
+  /** Change the room's up direction: re-orient camera and robot. */
+  setRoomUp(up) {
     this.state.roomUp = up;
     this.makeControls();
     this.sun.position.set(...add(scale(up, 900), [300, 0, 300]));
-    if (reframe) this.frameCamera();
+    this.resetRobotPlacement();
+    this.requestRender();
+  }
+
+  /** Put the scan (unrotated) ahead of the robot's home needle position. */
+  placeVolumeInFront() {
+    const vol = this.state.volume;
+    if (!vol) return;
+    const home = this.robot.needleInBase(this.robot.homePlatform, 0);
+    const tip0 = applyPose(this.robotWorld, home.tip0);
+    const dir = mulMV(this.robotWorld.R, home.dir);
+    const b = vol.bounds();
+    const halfAlong = 0.5 * Math.abs(dot(sub(b[1], b[0]), dir.map(Math.abs)));
+    // The scan centre sits a bit more than half its depth ahead of the retracted needle tip.
+    const centerWorld = add(tip0, scale(dir, halfAlong * 0.55 + 10));
+    this.setVolumePose({ p: sub(centerWorld, vol.center), R: I3() });
+  }
+
+  setVolumePose(T) {
+    this.volumePose = { p: [...T.p], R: T.R.map((r) => [...r]) };
+    setGroupMatrix(this.patientGroup, this.volumePose);
+    this.updateNeedleWorld();
+    this.syncBaseFields();
+    if (this.activeGimbal === 'volume' && !this.gimbal.dragging) this.syncHandles();
     this.requestRender();
   }
 
@@ -275,7 +367,7 @@ class App {
     setTimeout(() => {
       const t0 = performance.now();
       this.setVolume(createBreastPhantom());
-      setStatus(`Synthetic phantom ready (${(performance.now() - t0).toFixed(0)} ms). Pick a lesion as target in the Biopsy tab.`);
+      setStatus(`Synthetic phantom ready (${(performance.now() - t0).toFixed(0)} ms). Next: choose a target.`);
     }, 10);
   }
 
@@ -288,7 +380,7 @@ class App {
       if (!series.length) throw new Error(errors[0] || 'No DICOM images found');
       this.series = series;
       const sel = $('seriesSelect');
-      sel.innerHTML = series.map((s, i) => `<option value="${i}">${s.description}</option>`).join('');
+      sel.innerHTML = series.map((s, i) => `<option value="${i}">${esc(s.description)}</option>`).join('');
       sel.disabled = series.length < 2;
       this.loadSeries(0);
       if (errors.length) setStatus(`Loaded with ${errors.length} file(s) skipped: ${errors[0]}`, true);
@@ -313,6 +405,7 @@ class App {
   loadRobot(id) {
     const def = ROBOTS.find((r) => r.id === id);
     if (!def?.create) { setStatus(`${def?.name ?? id} is not available yet.`, true); return; }
+    if (this.motion) this.motion.cancel();
     const { robot, Visual } = def.create();
     this.robot = robot;
     if (this.visual) this.robotRoot.remove(this.visual.root);
@@ -324,64 +417,63 @@ class App {
     this.grid.rotation.x = Math.PI / 2;
     this.grid.position.z = -(robot.cfg.visual.footHeight + robot.cfg.visual.basePlateThickness);
     this.robotRoot.add(this.grid);
-    $('robotTitle').textContent = robot.cfg.name;
-    $('robotDesc').innerHTML = `${robot.cfg.description}${robot.cfg.provisional ? '<br><span class="warn">Geometry is provisional (estimated from photographs) until CAD joint coordinates are entered in <code>js/robots/stormram1.js</code>.</span>' : ''}`;
+    $('robotSelect').value = id;
+    $('robotName').textContent = robot.cfg.name;
+    $('robotDesc').innerHTML = `${esc(robot.cfg.description)}${robot.cfg.provisional ? `<br><span class="warn">${esc(robot.cfg.provisionalNote || 'Geometry is provisional.')}</span>` : ''}`;
     $('cadBody').innerHTML = this.visual.bodyNames.map((n) => `<option>${n}</option>`).join('');
-    this.buildJointUI();
+    this.jointRowSets = [];
+    this.buildJointUI($('jointSliders'));
+    if (this.jointPop) this.buildJointUI(this.jointPop.querySelector('.pop-joints'));
     this.buildCartesianUI();
     this.q = robot.homeJoints();
     this.platform = robot.homePlatform;
-    this.resetBasePlacement();
+    this.resetRobotPlacement();
+    this.placeVolumeInFront();
+    this.clearProcedure();
     this.applyJoints(this.q);
+    this.updateGuide();
   }
 
-  /** Default placement: robot upright in the room, needle pointing towards the volume centre. */
-  resetBasePlacement() {
+  /** Default placement: robot upright at the room origin, home needle direction along the room's x. */
+  resetRobotPlacement() {
     if (!this.robot) return;
     const up = this.state.roomUp;
-    const vol = this.state.volume;
-    const center = vol ? vol.center : [0, 0, 0];
-    // The home needle direction points horizontally; prefer the patient's left-right axis.
     let xr = [1, 0, 0];
     if (Math.abs(dot(xr, up)) > 0.9) xr = [0, 0, 1];
     xr = normalize(sub(xr, scale(up, dot(xr, up))));
     const zr = up, yr = cross(zr, xr);
     const home = this.robot.needleInBase(this.robot.homePlatform, 0);
     const az = Math.atan2(home.dir[1], home.dir[0]);
-    const R = mulMM(transpose([xr, yr, zr]), rotZ(-az));
-    const tip0 = home.tip0;
-    let standoff = 40;
-    if (vol) {
-      const b = vol.bounds();
-      // Half-extent of the volume along the needle direction.
-      standoff = 0.5 * Math.abs(dot(sub(b[1], b[0]), xr.map(Math.abs))) * 0.55 + 10;
-    }
-    const tipWorld = sub(center, scale(xr, standoff));
-    this.setBasePose({ p: sub(tipWorld, mulMV(R, tip0)), R });
+    this.setRobotWorld({ p: [0, 0, 0], R: mulMM(transpose([xr, yr, zr]), rotZ(-az)) });
   }
 
-  setBasePose(T) {
-    this.basePose = { p: [...T.p], R: T.R.map((r) => [...r]) };
-    this.robotRoot.matrix.fromArray(poseToMatrix4Array(this.basePose));
-    this.robotRoot.matrixWorldNeedsUpdate = true;
+  setRobotWorld(T) {
+    this.robotWorld = { p: [...T.p], R: T.R.map((r) => [...r]) };
+    setGroupMatrix(this.robotRoot, this.robotWorld);
     this.syncBaseFields();
     this.updateNeedleWorld();
-    if (this.gizmoMode?.startsWith('base') && !this.gizmo.dragging) setObjectPose(this.baseHandle, this.basePose);
+    if ((this.activeGimbal === 'base' || this.activeGimbal === 'tip') && !this.gimbal.dragging) this.syncHandles();
     this.requestRender();
   }
 
+  /** Set the robot base pose in the scan (LPS) frame. */
+  setBasePose(T) { this.setRobotWorld(composePose(this.volumePose, T)); }
+
   placeForTarget() {
     const s = this.state;
-    if (!s.target) { setStatus('Set a target first (Biopsy tab).', true); return; }
+    if (!s.target) { setStatus('Choose a target first.', true); return; }
     // Keep the orientation, move the base so the home needle axis passes through the target with
     // the target reached at mid-stroke.
-    const dirW = mulMV(this.basePose.R, mulMV(this.robot.homePlatform.R, this.robot.needle.dir));
+    const base = this.basePose;
+    const dirW = mulMV(base.R, mulMV(this.robot.homePlatform.R, this.robot.needle.dir));
     const tip0 = this.robot.needleInBase(this.robot.homePlatform, 0).tip0;
     const reach = (this.robot.needle.min + this.robot.needle.max) / 2 + this.preFireAdvance();
-    const tipWorld = sub(s.target, scale(dirW, reach));
-    this.setBasePose({ p: sub(tipWorld, mulMV(this.basePose.R, tip0)), R: this.basePose.R });
+    const tipLps = sub(s.target, scale(dirW, reach));
+    this.setBasePose({ p: sub(tipLps, mulMV(base.R, tip0)), R: base.R });
+    this.robotPlaced = true;
     this.clearProcedure();
-    setStatus('Robot base moved so that the target lies on the home needle axis.');
+    this.updateGuide();
+    setStatus('Robot moved so that the target lies on its home needle axis. Next: plan the needle path.');
   }
 
   /** Distance between the pre-fire tip and the target for the selected targeting mode. */
@@ -403,11 +495,12 @@ class App {
     this.syncJointUI();
     if (!fromCartesian) this.syncCartesianUI();
     this.updateReadouts();
-    if (this.gizmoMode?.startsWith('tip') && !this.gizmo.dragging) this.placeTipHandle();
+    if (this.activeGimbal === 'tip' && !this.gimbal.dragging) this.syncHandles();
     this.requestRender();
     return true;
   }
 
+  /** Needle state in the scan frame (used by the slice views and the biopsy evaluation). */
   updateNeedleWorld() {
     if (!this.robot || !this.platform) return;
     const nb = this.robot.needleInBase(this.platform, this.q[6]);
@@ -452,10 +545,10 @@ class App {
   }
 
   // ---------------------------------------------------------------- joint / cartesian UI -----
-  buildJointUI() {
-    const box = $('jointSliders');
+  /** Build a set of joint sliders into `box`; several sets (panel, pop-up) stay in sync. */
+  buildJointUI(box) {
     box.innerHTML = '';
-    this.jointRows = this.robot.joints.map((j, i) => {
+    const rows = this.robot.joints.map((j, i) => {
       const row = document.createElement('div');
       row.className = 'joint';
       row.innerHTML = `<span class="name">${j.name}</span><input type="range" min="${j.min}" max="${j.max}" step="${j.step}"><input type="number" step="${j.step}"><span class="steps"></span>`;
@@ -475,20 +568,24 @@ class App {
       box.appendChild(row);
       return { row, range, numIn, steps: row.querySelector('.steps') };
     });
+    this.jointRowSets.push(rows);
+    if (this.q) this.syncJointUI();
   }
 
   syncJointUI() {
-    if (!this.jointRows) return;
+    if (!this.jointRowSets) return;
     const home = this.robot.homeJoints();
     const bad = new Set((this.lastIK?.violations || []).map((v) => v.leg));
-    this.jointRows.forEach((r, i) => {
-      const j = this.robot.joints[i];
-      if (document.activeElement !== r.range) r.range.value = this.q[i];
-      if (document.activeElement !== r.numIn) r.numIn.value = this.q[i].toFixed(2);
-      const steps = Math.round((this.q[i] - home[i]) / j.step);
-      r.steps.textContent = `${steps >= 0 ? '+' : ''}${steps} steps from home · range ${j.min}–${j.max} ${j.unit}`;
-      r.row.classList.toggle('bad', bad.has(i));
-    });
+    for (const rows of this.jointRowSets) {
+      rows.forEach((r, i) => {
+        const j = this.robot.joints[i];
+        if (document.activeElement !== r.range) r.range.value = this.q[i];
+        if (document.activeElement !== r.numIn) r.numIn.value = this.q[i].toFixed(2);
+        const steps = Math.round((this.q[i] - home[i]) / j.step);
+        r.steps.textContent = `${steps >= 0 ? '+' : ''}${steps} steps from home · range ${j.min}–${j.max} ${j.unit}`;
+        r.row.classList.toggle('bad', bad.has(i));
+      });
+    }
   }
 
   buildCartesianUI() {
@@ -562,69 +659,281 @@ class App {
     const p = this.platform;
     const rpy = toRPY(mulMM(p.R, transpose(this.robot.homePlatform.R))).map((a) => a / DEG);
     const ik = this.lastIK;
-    const nw = this.state.needle;
-    const txt = [
+    const lines = [
       `Platform position   ${fmtV(p.p)} mm`,
       `Platform roll/pitch/yaw ${fmtV(rpy)} °`,
       `Needle tip (base)   ${fmtV(nb.tip)} mm`,
       `Needle dir (base)   ${fmtV(nb.dir, 3)}`,
-      `Needle tip (LPS)    ${fmtV(nw.tip)} mm`,
-      `Leg lengths ${this.q.slice(0, 6).map((v) => fmt(v, 1)).join(' ')}`,
-      `Joint margin ${(ik.margin * 100).toFixed(0)}%  ${ik.ok ? 'OK' : 'LIMIT VIOLATED'}`,
-    ].join('\n');
-    $('fkReadout').textContent = txt;
-    $('cartReadout').textContent = txt;
+    ];
+    if (this.state.volume) lines.push(`Needle tip (LPS)    ${fmtV(this.state.needle.tip)} mm`);
+    lines.push(`Leg lengths ${this.q.slice(0, 6).map((v) => fmt(v, 1)).join(' ')}`,
+      `Joint margin ${(ik.margin * 100).toFixed(0)}%  ${ik.ok ? 'OK' : 'LIMIT VIOLATED'}`);
+    $('fkReadout').textContent = lines.join('\n');
+    $('cartReadout').textContent = lines.join('\n');
   }
 
   // ---------------------------------------------------------------- base placement UI --------
   buildBaseFields() {
     const box = $('basePoseFields');
     const keys = ['x', 'y', 'z', 'rx', 'ry', 'rz'];
-    box.innerHTML = keys.map((k) => `<label>${k}<input type="number" data-k="${k}" step="${k.startsWith('r') ? 1 : 1}"></label>`).join('');
+    box.innerHTML = keys.map((k) => `<label>${k}<input type="number" data-k="${k}" step="1"></label>`).join('');
     box.querySelectorAll('input').forEach((inp) => inp.addEventListener('change', () => {
       const v = Object.fromEntries([...box.querySelectorAll('input')].map((i) => [i.dataset.k, Number(i.value)]));
-      this.setBasePose({ p: [v.x, v.y, v.z], R: fromRPY(v.rx * DEG, v.ry * DEG, v.rz * DEG) });
+      this.setRobotWorld({ p: [v.x, v.y, v.z], R: fromRPY(v.rx * DEG, v.ry * DEG, v.rz * DEG) });
+      this.robotPlaced = true;
       this.clearProcedure();
+      this.updateGuide();
     }));
   }
 
   syncBaseFields() {
     const box = $('basePoseFields');
     if (!box.children.length) return;
-    const rpy = toRPY(this.basePose.R).map((a) => a / DEG);
-    const vals = { x: this.basePose.p[0], y: this.basePose.p[1], z: this.basePose.p[2], rx: rpy[0], ry: rpy[1], rz: rpy[2] };
+    const T = this.robotWorld;
+    const rpy = toRPY(T.R).map((a) => a / DEG);
+    const vals = { x: T.p[0], y: T.p[1], z: T.p[2], rx: rpy[0], ry: rpy[1], rz: rpy[2] };
     box.querySelectorAll('input').forEach((i) => { if (document.activeElement !== i) i.value = vals[i.dataset.k].toFixed(1); });
   }
 
-  // ---------------------------------------------------------------- 3D manipulator -----------
-  setGizmoMode(mode) {
-    this.gizmoMode = mode;
-    document.querySelectorAll('[data-gizmo]').forEach((b) => b.classList.toggle('active', b.dataset.gizmo === mode));
-    this.gizmo.detach();
-    if (mode === 'none') return;
-    const [obj, kind] = mode.split('-');
-    if (obj === 'tip') { this.placeTipHandle(); this.gizmo.attach(this.tipHandle); this.gizmo.setSpace('local'); }
-    else { setObjectPose(this.baseHandle, this.basePose); this.gizmo.attach(this.baseHandle); this.gizmo.setSpace('world'); }
-    this.gizmo.setMode(kind);
+  // ---------------------------------------------------------------- gimbals ------------------
+  /** Turn a gimbal on (or off when it is already on). Only one is active at a time. */
+  toggleGimbal(name) {
+    this.activeGimbal = this.activeGimbal === name ? null : name;
+    this.gimbal.detach();
+    if (this.activeGimbal) {
+      this.syncHandles();
+      const spaces = { base: ['world', 'local'], tip: ['local', 'local'], volume: ['world', 'local'] }[name];
+      this.gimbal.attach(this.handles[name], { moveSpace: spaces[0], turnSpace: spaces[1] });
+      const what = { base: 'the robot', tip: 'the needle tip', volume: 'the scan' }[name];
+      setStatus(`Drag an arrow to move ${what}, or a ring to rotate it. Esc turns the gimbal off.`);
+    }
+    this.updateOverlayButtons();
+    this.updateGuide();
+    this.requestRender();
   }
 
-  placeTipHandle() {
-    const nb = this.robot.needleInBase(this.platform, this.q[6]);
-    setObjectPose(this.tipHandle, composePose(this.basePose, { p: nb.tip, R: this.platform.R }));
-  }
-
-  onGizmoChange() {
-    if (this.gizmoMode.startsWith('base')) {
-      this.setBasePose(objectPose(this.baseHandle));
-      this.clearProcedure();
-    } else {
-      const T = composePose(invertPose(this.basePose), objectPose(this.tipHandle));
-      this.commandTipPose(T.p, T.R);
+  /** Put the gimbal handle on the current pose of whatever it manipulates. */
+  syncHandles() {
+    const g = this.activeGimbal;
+    if (g === 'base') setObjectPose(this.handles.base, this.robotWorld);
+    if (g === 'tip') {
+      const nb = this.robot.needleInBase(this.platform, this.q[6]);
+      setObjectPose(this.handles.tip, composePose(this.robotWorld, { p: nb.tip, R: this.platform.R }));
+    }
+    if (g === 'volume' && this.state.volume) {
+      setObjectPose(this.handles.volume, { p: this.lpsToWorld(this.state.volume.center), R: this.volumePose.R });
     }
   }
 
-  onGizmoRelease() {
-    if (this.gizmoMode?.startsWith('tip')) this.placeTipHandle();
+  onGimbalChange() {
+    const g = this.activeGimbal;
+    if (g === 'base') {
+      this.setRobotWorld(objectPose(this.handles.base));
+      if (!this.robotPlaced) { this.robotPlaced = true; this.updateGuide(); }
+      if (this.state.plan || this.state.core) this.clearProcedure();
+    } else if (g === 'tip') {
+      const T = composePose(invertPose(this.robotWorld), objectPose(this.handles.tip));
+      this.commandTipPose(T.p, T.R);
+    } else if (g === 'volume') {
+      const H = objectPose(this.handles.volume);
+      this.setVolumePose({ p: sub(H.p, mulMV(H.R, this.state.volume.center)), R: H.R });
+      if (this.state.plan || this.state.core) this.clearProcedure();
+    }
+  }
+
+  // ---------------------------------------------------------------- 3D overlays --------------
+  initOverlays() {
+    const root = $('overlays');
+    const btn = (label, action, title = '') => `<button data-action="${action}" title="${esc(title)}">${label}</button>`;
+    const robotOrigin = () => this.robotWorld.p;
+    this.anchors = {
+      base: new Anchor(root, { offset: [14, 22], point: robotOrigin }),
+      joints: new Anchor(root, {
+        offset: [14, -14],
+        point: () => scale(add(this.robotWorld.p, applyPose(this.robotWorld, this.platform.p)), 0.5),
+      }),
+      tip: new Anchor(root, {
+        offset: [14, -30],
+        point: () => this.state.needle && this.lpsToWorld(this.state.needle.tip),
+      }),
+      volume: new Anchor(root, { offset: [10, -34], point: () => this.volumeAnchorPoint() }),
+    };
+    this.anchors.base.el.innerHTML = '<span class="dot"></span>' + btn('Enable robot position gimbal', 'gimbal:base', 'Move and rotate the whole robot');
+    this.anchors.joints.el.innerHTML = btn('Enable joint control', 'pop:joints', 'Sliders for each motor');
+    this.anchors.tip.el.innerHTML = '<span class="dot"></span>' + btn('Enable end-effector gimbal', 'gimbal:tip', 'Move and rotate the needle tip (inverse kinematics)');
+    this.anchors.volume.el.innerHTML = btn('Enable gimbal', 'gimbal:volume', 'Move and rotate the scan') + btn('View settings', 'pop:view', 'Slices and contrast');
+    for (const a of Object.values(this.anchors)) {
+      // Touch screens show one gimbal mode at a time; this button switches it.
+      a.el.insertAdjacentHTML('beforeend', '<button data-action="gimbal-mode" class="hidden" title="Switch between moving and rotating">Rotate instead</button>');
+    }
+
+    // Pop-up: joint sliders next to the robot.
+    this.jointPop = document.createElement('div');
+    this.jointPop.className = 'popover hidden';
+    this.jointPop.innerHTML = `<div class="pop-head"><span>Joint control</span><button data-action="pop:joints" title="Close">×</button></div>
+      <div class="pop-joints"></div>
+      <div class="row">${btn('Home', 'home')}${btn('All joint settings…', 'open:joints')}</div>`;
+    root.appendChild(this.jointPop);
+
+    // Pop-up: basic view settings next to the scan.
+    this.viewPop = document.createElement('div');
+    this.viewPop.className = 'popover hidden';
+    this.viewPop.innerHTML = `<div class="pop-head"><span>View settings</span><button data-action="pop:view" title="Close">×</button></div>
+      <label class="field">Brightness (window center) <input type="range" id="pvCenter"><output id="pvCenterOut"></output></label>
+      <label class="field">Contrast (window width) <input type="range" id="pvWidth"><output id="pvWidthOut"></output></label>
+      <label class="field">Hide dark voxels in 3D <input type="range" id="pvThr" min="0" max="255" value="60"><output id="pvThrOut">60</output></label>
+      <label class="field">Sagittal slice (x) <input type="range" id="pvSlicex"><output id="pvSlicexOut"></output></label>
+      <label class="field">Coronal slice (y) <input type="range" id="pvSlicey"><output id="pvSliceyOut"></output></label>
+      <label class="field">Axial slice (z) <input type="range" id="pvSlicez"><output id="pvSlicezOut"></output></label>
+      <label class="check"><input type="checkbox" id="pvShow" checked> Show slices in 3D</label>
+      <div class="row">${btn('Slice views', 'dock')}${btn('All scan settings…', 'open:scan')}</div>`;
+    root.appendChild(this.viewPop);
+    $('pvCenter').oninput = (e) => { this.state.window.center = Number(e.target.value); this.onWindowChanged(); };
+    $('pvWidth').oninput = (e) => { this.state.window.width = Number(e.target.value); this.onWindowChanged(); };
+    $('pvThr').oninput = (e) => this.setThreshold(Number(e.target.value));
+    $('pvShow').onchange = (e) => { $('showSlices3d').checked = e.target.checked; this.requestRender(); };
+    ['x', 'y', 'z'].forEach((k, a) => {
+      $(`pvSlice${k}`).oninput = (e) => {
+        const c = [...this.state.cursor];
+        c[a] = Number(e.target.value);
+        this.state.cursor = c;
+        this.requestRender();
+      };
+    });
+
+    root.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-action]');
+      if (b) this.runAction(b.dataset.action);
+    });
+    this.updateOverlayButtons();
+  }
+
+  /** The top-most (on screen) corner of the scan's bounding box, in room coordinates. */
+  volumeAnchorPoint() {
+    const vol = this.state.volume;
+    if (!vol) return null;
+    let best = null, bestY = Infinity;
+    for (const c of vol.corners()) {
+      const w = this.lpsToWorld(c);
+      const y = new THREE.Vector3(...w).project(this.camera).y * -1;
+      if (y < bestY) { bestY = y; best = w; }
+    }
+    return best;
+  }
+
+  updateOverlayButtons() {
+    const set = (action, on, onLabel, offLabel) => {
+      document.querySelectorAll(`[data-action="${action}"]`).forEach((b) => {
+        if (b.closest('.pop-head')) return;
+        b.classList.toggle('active', on);
+        if (b.closest('.anchor')) b.textContent = on ? onLabel : offLabel;
+      });
+    };
+    set('gimbal:base', this.activeGimbal === 'base', 'Disable robot position gimbal', 'Enable robot position gimbal');
+    set('gimbal:tip', this.activeGimbal === 'tip', 'Disable end-effector gimbal', 'Enable end-effector gimbal');
+    set('gimbal:volume', this.activeGimbal === 'volume', 'Disable gimbal', 'Enable gimbal');
+    set('pop:joints', !this.jointPop.classList.contains('hidden'), 'Hide joint control', 'Enable joint control');
+    set('pop:view', !this.viewPop.classList.contains('hidden'), 'Hide view settings', 'View settings');
+    for (const [name, a] of Object.entries(this.anchors)) {
+      const mode = a.el.querySelector('[data-action="gimbal-mode"]');
+      mode.classList.toggle('hidden', !(this.gimbal.touch && this.activeGimbal === name));
+      mode.textContent = this.gimbal.mode === 'rotate' ? 'Move instead' : 'Rotate instead';
+    }
+  }
+
+  togglePopover(pop) {
+    pop.classList.toggle('hidden');
+    this.updateOverlayButtons();
+    this.requestRender();
+  }
+
+  setThreshold(v) {
+    this.state.threshold3D = v;
+    for (const [id, out] of [['thr3d', 'thr3dOut'], ['pvThr', 'pvThrOut']]) { $(id).value = v; $(out).textContent = v; }
+    this.requestRender();
+  }
+
+  openPanel(name) {
+    const p = document.querySelector(`.panel[data-panel="${name}"]`);
+    if (!p) return;
+    p.open = true;
+    p.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
+  /** Named UI actions shared by the guide, the 3D buttons and the pop-ups. */
+  runAction(action) {
+    const [kind, arg] = action.split(':');
+    switch (kind) {
+      case 'gimbal': return this.toggleGimbal(arg);
+      case 'gimbal-mode':
+        this.gimbal.setMode(this.gimbal.mode === 'rotate' ? 'translate' : 'rotate');
+        return this.updateOverlayButtons();
+      case 'pop': return this.togglePopover(arg === 'joints' ? this.jointPop : this.viewPop);
+      case 'open': return this.openPanel(arg);
+      case 'dock': return this.setSliceDock($('sliceDock').classList.contains('collapsed'));
+      case 'home':
+        this.state.fire = 0; this.visual.setFire(0, false);
+        return this.moveJoints(this.robot.homeJoints(), { label: 'Homing' });
+      case 'phantom': return this.loadPhantom();
+      case 'dicom-files': return $('dicomFiles').click();
+      case 'dicom-folder': return $('dicomFolder').click();
+      case 'pick-target':
+        this.setSliceDock(true);
+        return this.setPickMode('target');
+      case 'lesion': return this.setTarget(this.state.volume.meta.lesions[Number(arg)].center);
+      case 'place-for-target': return this.placeForTarget();
+      case 'plan': return this.plan();
+      case 'run-all': return this.runAll();
+      default: return undefined;
+    }
+  }
+
+  // ---------------------------------------------------------------- get-started guide --------
+  updateGuide() {
+    const box = $('guide');
+    if (!box || !this.robot) return;
+    const s = this.state;
+    const steps = [
+      {
+        title: 'Add an MRI scan', done: !!s.volume,
+        text: s.volume ? `Loaded: ${esc(s.volume.name)}.` : 'Load a scan to plan a biopsy. The synthetic phantom contains three lesions.',
+        actions: s.volume ? '<button data-action="open:scan">Scan settings</button>'
+          : '<button data-action="phantom" class="primary">Synthetic phantom</button><button data-action="dicom-files">DICOM files…</button><button data-action="dicom-folder">Folder…</button>',
+      },
+      {
+        title: 'Choose a target', done: !!s.target, locked: !s.volume,
+        text: s.target ? `Target at ${fmtV(s.target, 0)} (LPS).` : 'Click the lesion in the slice views, or pick one of the phantom lesions.',
+        actions: '<button data-action="pick-target">Pick in slice views</button>'
+          + (s.volume?.meta?.lesions || []).map((L, i) => `<button data-action="lesion:${i}">${esc(L.name.replace(/ \(.*/, ''))}</button>`).join(''),
+      },
+      {
+        title: 'Position the robot', done: this.robotPlaced, locked: !s.volume,
+        text: 'Let the simulator place the robot so the target is on its needle axis, or drag it with the robot position gimbal.',
+        actions: `<button data-action="place-for-target" ${s.target ? '' : 'disabled'}>Place robot for target</button>`
+          + `<button data-action="gimbal:base" class="${this.activeGimbal === 'base' ? 'active' : ''}">Robot gimbal</button>`,
+      },
+      {
+        title: 'Plan the needle path', done: !!s.plan?.ok, locked: !s.target,
+        text: s.plan ? $('planInfo').innerHTML : 'Compute the robot pose that aligns the needle with the target.',
+        actions: '<button data-action="plan">Plan</button><button data-action="open:biopsy">Trajectory options…</button>',
+      },
+      {
+        title: 'Perform the biopsy', done: !!s.core, locked: !s.plan?.ok,
+        text: s.core ? `${$('procInfo').innerHTML}<br>The sampled core is shown in orange.` : 'Align the needle, insert, fire the biopsy gun and retract.',
+        actions: '<button data-action="run-all" class="primary">Run all steps</button><button data-action="open:biopsy">Step by step…</button>',
+      },
+    ];
+    const current = steps.findIndex((st) => !st.done && !st.locked);
+    box.innerHTML = steps.map((st, i) => `<div class="guide-step ${st.done ? 'done' : ''} ${st.locked ? 'locked' : ''} ${i === current ? 'current' : ''}">
+        <div class="title"><span class="num">${st.done ? '✓' : i + 1}</span>${st.title}</div>
+        ${st.locked ? '' : `<p>${st.text}</p><div class="row">${st.actions}</div>`}
+      </div>`).join('')
+      + `<h3>Explore</h3>
+      <div class="guide-step"><div class="title">Switch robot</div>
+        <div class="row"><select data-role="robot">${ROBOTS.map((r) => `<option value="${r.id}" ${r.id === this.robot.cfg.id ? 'selected' : ''} ${r.create ? '' : 'disabled'}>${r.name}${r.create ? '' : ' (coming)'}</option>`).join('')}</select></div></div>
+      <div class="guide-step"><div class="title">Move the robot</div>
+        <p>Use the buttons on the robot in the 3D view, or here:</p>
+        <div class="row"><button data-action="pop:joints">Joint control</button><button data-action="gimbal:tip" class="${this.activeGimbal === 'tip' ? 'active' : ''}">End-effector gimbal</button></div></div>`;
   }
 
   // ---------------------------------------------------------------- biopsy workflow ----------
@@ -641,6 +950,8 @@ class App {
     this.clearProcedure();
     this.updateTargetInfo();
     this.updatePlanPreview();
+    this.updateGuide();
+    setStatus('Target set. Next: position the robot.');
     this.requestRender();
   }
 
@@ -649,7 +960,7 @@ class App {
     $('targetInfo').innerHTML = t ? `Target (LPS): ${fmtV(t)} mm` : 'No target set.';
   }
 
-  /** Requested needle direction in world coordinates, or null if incomplete. */
+  /** Requested needle direction in the scan frame, or null if incomplete. */
   requestedDirection() {
     const s = this.state, mode = $('dirMode').value;
     const homeDirBase = mulMV(this.robot.homePlatform.R, this.robot.needle.dir);
@@ -668,7 +979,7 @@ class App {
 
   updatePlanPreview() {
     const s = this.state;
-    const dir = this.requestedDirection();
+    const dir = s.target && this.robot ? this.requestedDirection() : null;
     if (s.target && dir) {
       const back = sub(s.target, scale(dir, 200));
       this.planLine.geometry.setFromPoints([new THREE.Vector3(...back), new THREE.Vector3(...s.target)]);
@@ -683,7 +994,8 @@ class App {
     if (!s.target) { setStatus('Set a target first.', true); return null; }
     const dirW = this.requestedDirection();
     if (!dirW) { setStatus('Pick an entry point to define the trajectory.', true); return null; }
-    const toBase = invertPose(this.basePose);
+    const base = this.basePose;
+    const toBase = invertPose(base);
     const preFire = this.preFireAdvance();
     const tipGoalW = sub(s.target, scale(dirW, preFire));
     const dirB = mulMV(toBase.R, dirW);
@@ -692,8 +1004,8 @@ class App {
     const q = $('quantize').checked ? this.robot.quantize(res.q) : res.q;
     const fq = this.robot.fk(q, res.platform);
     const nb = this.robot.needleInBase(fq.platform, q[6]);
-    const tipW = applyPose(this.basePose, nb.tip);
-    const dirWa = mulMV(this.basePose.R, nb.dir);
+    const tipW = applyPose(base, nb.tip);
+    const dirWa = mulMV(base.R, nb.dir);
     const lineErr = HexapodNeedleRobot.pointLineDistance(tipGoalW, tipW, dirWa);
     s.plan = { ...res, q, target: s.target, tipGoal: tipGoalW, dir: dirW, preFire, predictedTipError: dist(tipW, tipGoalW), predictedLineError: lineErr };
     const info = $('planInfo');
@@ -701,17 +1013,19 @@ class App {
       info.innerHTML = `<span class="ok">Feasible.</span> Insertion ${fmt(res.depth)} mm, roll ${fmt(res.roll / DEG, 0)}°, joint margin ${(res.margin * 100).toFixed(0)}%.<br>`
         + `Step quantisation: tip error ${fmt(s.plan.predictedTipError, 2)} mm, off-axis ${fmt(lineErr, 2)} mm.`;
     } else {
-      info.innerHTML = `<span class="bad">Not reachable</span> from this robot placement: ${describeViolations(res.violations, this.robot)}.<br>Try “Place robot for target” (Robot tab), another direction, or move the base.`;
+      info.innerHTML = `<span class="bad">Not reachable</span> from this robot placement: ${describeViolations(res.violations, this.robot)}.<br>Try “Place robot for target”, another direction, or move the robot.`;
     }
     this.updatePlanPreview();
     this.updateProcedureButtons();
+    this.updateGuide();
     setStatus(res.ok ? 'Plan ready: Align → Insert → Fire → Retract.' : 'Plan infeasible.', !res.ok);
     return s.plan;
   }
 
-  /** Discard plan and biopsy state (the plan is tied to the current target and base placement). */
+  /** Discard plan and biopsy state (the plan is tied to the current target and robot placement). */
   clearProcedure() {
     const s = this.state;
+    const had = !!(s.plan || s.core);
     s.plan = null;
     s.core = null;
     s.fire = 0;
@@ -722,6 +1036,7 @@ class App {
     $('procInfo').innerHTML = '';
     this.updateProcedureButtons();
     this.updatePlanPreview();
+    if (had) this.updateGuide();
   }
 
   updateProcedureButtons() {
@@ -792,6 +1107,7 @@ class App {
       this.state.core = nw.notch.map((x) => [...x]);
       this.procStage = 3;
       $('procInfo').innerHTML = this.evaluateCore(p.target);
+      this.updateGuide();
       setStatus('Biopsy fired. Next: Retract.');
     });
   }
@@ -848,18 +1164,29 @@ class App {
 
   // ---------------------------------------------------------------- UI wiring ----------------
   initUI() {
-    document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => {
-      document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('active', x === b));
-      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.panel === b.dataset.tab));
-    }));
     $('robotSelect').innerHTML = ROBOTS.map((r) => `<option value="${r.id}" ${r.create ? '' : 'disabled'}>${r.name}${r.create ? '' : ' (coming)'}</option>`).join('');
     $('robotSelect').addEventListener('change', (e) => this.loadRobot(e.target.value));
-    document.querySelectorAll('[data-gizmo]').forEach((b) => b.addEventListener('click', () => this.setGizmoMode(b.dataset.gizmo)));
+    $('resetView').onclick = () => this.frameCamera();
 
-    // Scan tab.
+    // Guide: buttons run named actions; the robot selector switches robots.
+    $('guide').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-action]');
+      if (b && !b.disabled) this.runAction(b.dataset.action);
+    });
+    $('guide').addEventListener('change', (e) => {
+      if (e.target.dataset.role === 'robot') this.loadRobot(e.target.value);
+    });
+    $('dockTab').onclick = () => this.runAction('dock');
+    // Panels behave as an accordion (the guide stays open independently).
+    document.querySelectorAll('.panel').forEach((p) => p.addEventListener('toggle', () => {
+      if (!p.open || p.dataset.panel === 'guide') return;
+      document.querySelectorAll('.panel').forEach((o) => { if (o !== p && o.dataset.panel !== 'guide') o.open = false; });
+    }));
+
+    // Scan panel.
     $('loadPhantom').onclick = () => this.loadPhantom();
-    $('dicomFiles').onchange = (e) => this.loadDicom(e.target.files);
-    $('dicomFolder').onchange = (e) => this.loadDicom(e.target.files);
+    $('dicomFiles').onchange = (e) => { this.loadDicom(e.target.files); e.target.value = ''; };
+    $('dicomFolder').onchange = (e) => { this.loadDicom(e.target.files); e.target.value = ''; };
     $('seriesSelect').onchange = (e) => this.loadSeries(Number(e.target.value));
     const dz = $('dropZone');
     const over = (e) => { e.preventDefault(); dz.classList.add('over'); };
@@ -872,15 +1199,21 @@ class App {
     });
     $('wlCenter').oninput = (e) => { this.state.window.center = Number(e.target.value); this.onWindowChanged(); };
     $('wlWidth').oninput = (e) => { this.state.window.width = Number(e.target.value); this.onWindowChanged(); };
-    $('thr3d').oninput = (e) => { this.state.threshold3D = Number(e.target.value); $('thr3dOut').textContent = e.target.value; this.requestRender(); };
-    $('showSlices3d').onchange = () => this.requestRender();
+    $('thr3d').oninput = (e) => this.setThreshold(Number(e.target.value));
+    $('showSlices3d').onchange = (e) => { if ($('pvShow')) $('pvShow').checked = e.target.checked; this.requestRender(); };
     $('showObliqueIn3d').onchange = () => this.requestRender();
-    $('roomUp').onchange = (e) => { this.setRoomUp(e.target.value.split(',').map(Number)); this.resetBasePlacement(); this.frameCamera(); };
+    $('roomUp').onchange = (e) => {
+      this.setRoomUp(e.target.value.split(',').map(Number));
+      this.placeVolumeInFront();
+      this.clearProcedure();
+      this.frameCamera();
+    };
+    $('resetVolume').onclick = () => { this.placeVolumeInFront(); this.clearProcedure(); this.frameCamera(); };
 
-    // Robot tab.
+    // Robot panel.
     this.buildBaseFields();
     $('placeForTarget').onclick = () => this.placeForTarget();
-    $('resetBase').onclick = () => { this.resetBasePlacement(); this.clearProcedure(); };
+    $('resetBase').onclick = () => { this.resetRobotPlacement(); this.robotPlaced = false; this.clearProcedure(); this.updateGuide(); };
     $('cadFile').onchange = async (e) => {
       const f = e.target.files[0];
       if (!f) return;
@@ -896,20 +1229,26 @@ class App {
     $('robotGhost').onchange = (e) => {
       this.visual.root.traverse((o) => {
         if (!o.material || o.isSprite) return;
-        o.material.transparent = e.target.checked || o.material.userData.wasTransparent;
         if (o.material.userData.opacity0 === undefined) { o.material.userData.opacity0 = o.material.opacity; o.material.userData.wasTransparent = o.material.transparent; }
+        o.material.transparent = e.target.checked || o.material.userData.wasTransparent;
         o.material.opacity = e.target.checked ? 0.35 : o.material.userData.opacity0;
         o.material.depthWrite = !e.target.checked;
       });
       this.requestRender();
     };
 
-    // Joints tab.
-    $('homeBtn').onclick = () => { this.state.fire = 0; this.visual.setFire(0, false); this.moveJoints(this.robot.homeJoints(), { label: 'Homing' }); };
+    // Joints panel.
+    $('homeBtn').onclick = () => this.runAction('home');
 
-    // Biopsy tab.
-    $('pickTarget').onclick = () => this.setPickMode(this.pickMode === 'target' ? 'cursor' : 'target');
-    $('pickEntry').onclick = () => this.setPickMode(this.pickMode === 'entry' ? 'cursor' : 'entry');
+    // Biopsy panel.
+    $('pickTarget').onclick = () => {
+      if (this.pickMode === 'target') this.setPickMode('cursor');
+      else this.runAction('pick-target');
+    };
+    $('pickEntry').onclick = () => {
+      this.setSliceDock(true);
+      this.setPickMode(this.pickMode === 'entry' ? 'cursor' : 'entry');
+    };
     $('targetFromCursor').onclick = () => this.setTarget(this.state.cursor);
     $('dirMode').onchange = (e) => {
       $('entryRow').classList.toggle('hidden', e.target.value !== 'entry');
@@ -932,7 +1271,11 @@ class App {
       await this.retract();
       this.moveJoints(this.robot.homeJoints(), { label: 'Homing' });
     };
-    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') { this.setPickMode('cursor'); this.setGizmoMode('none'); } });
+    window.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      this.setPickMode('cursor');
+      if (this.activeGimbal) this.toggleGimbal(this.activeGimbal);
+    });
   }
 
   // ---------------------------------------------------------------- render loop --------------
@@ -948,6 +1291,7 @@ class App {
       m.matrixWorldNeedsUpdate = true;
       if (m.userData.version !== view.version) { m.userData.tex.needsUpdate = true; m.userData.version = view.version; }
     }
+    if (this.volumeBox) this.volumeBox.visible = !!this.state.volume;
   }
 
   update3DMarkers() {
@@ -964,18 +1308,54 @@ class App {
       this.coreMesh.scale.set(1, dist(A, B), 1);
       this.coreMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(...normalize(sub(B, A))));
     }
+    // Slice positions in the view-settings pop-up follow the cursor.
+    if (s.volume) {
+      ['x', 'y', 'z'].forEach((k, a) => {
+        const el = $(`pvSlice${k}`);
+        if (document.activeElement !== el) el.value = s.cursor[a];
+        $(`pvSlice${k}Out`).textContent = `${fmt(s.cursor[a], 0)} mm`;
+      });
+    }
+  }
+
+  /** Pin the 3D buttons and pop-ups to their scene objects. */
+  updateOverlays() {
+    const [w, h] = this.viewSize;
+    for (const [name, a] of Object.entries(this.anchors)) {
+      a.update(this.camera, w, h);
+      if (name === 'volume' && !this.state.volume) a.el.style.display = 'none';
+    }
+    // Pop-ups open beside their button (right, or left when there is no room), vertically centred.
+    const place = (pop, anchor) => {
+      if (pop.classList.contains('hidden')) return;
+      if (!anchor.screen) { pop.style.visibility = 'hidden'; return; }
+      pop.style.visibility = '';
+      const host = $('view3d').getBoundingClientRect();
+      const a = anchor.el.getBoundingClientRect();
+      const r = pop.getBoundingClientRect();
+      const left = a.left - host.left, right = a.right - host.left, mid = a.top - host.top + a.height / 2;
+      let x = right + 10;
+      if (x + r.width > w - 8) x = left - r.width - 10;
+      x = Math.min(Math.max(x, 8), w - r.width - 8);
+      const y = Math.min(Math.max(mid - r.height / 2, 8), h - r.height - 8);
+      pop.style.transform = `translate(${x}px, ${y}px)`;
+    };
+    place(this.jointPop, this.anchors.joints);
+    if (!this.state.volume) this.viewPop.classList.add('hidden');
+    place(this.viewPop, this.anchors.volume);
   }
 
   loop() {
     requestAnimationFrame(() => this.loop());
     if (this.dirty) {
       this.dirty = false;
-      for (const v of Object.values(this.views)) v.render();
+      if (this.state.volume) for (const v of Object.values(this.views)) v.render();
       this.updateSlicePlanes();
       this.update3DMarkers();
     }
     this.orbit.update();
     this.renderer.render(this.scene, this.camera);
+    this.updateOverlays();
   }
 }
 

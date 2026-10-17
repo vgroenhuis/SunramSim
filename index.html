@@ -18,165 +18,180 @@
 <body>
   <header class="topbar">
     <div class="brand">SunramSim <span class="sub">MRI-guided biopsy robot simulator</span></div>
-    <label class="robot-select">Robot
-      <select id="robotSelect"></select>
-    </label>
     <div class="spacer"></div>
-    <div class="gizmo-modes" role="group" aria-label="3D manipulator">
-      <span>3D handle:</span>
-      <button data-gizmo="none" class="active">Off</button>
-      <button data-gizmo="tip-translate">Needle tip ↔</button>
-      <button data-gizmo="tip-rotate">Needle tip ⟳</button>
-      <button data-gizmo="base-translate">Robot base ↔</button>
-      <button data-gizmo="base-rotate">Robot base ⟳</button>
-    </div>
+    <span id="robotName" class="robot-name"></span>
+    <button id="resetView" title="Fit the robot and scan in view">Reset view</button>
   </header>
 
-  <aside class="sidebar">
-    <nav class="tabs">
-      <button data-tab="scan" class="active">Scan</button>
-      <button data-tab="robot">Robot</button>
-      <button data-tab="joints">Joints</button>
-      <button data-tab="cartesian">Cartesian</button>
-      <button data-tab="biopsy">Biopsy</button>
-    </nav>
-
-    <section class="tab-panel active" data-panel="scan">
-      <h3>Image data</h3>
-      <div class="row">
-        <button id="loadPhantom">Synthetic breast phantom</button>
-      </div>
-      <div class="row">
-        <label class="file-btn">DICOM files…<input type="file" id="dicomFiles" multiple hidden></label>
-        <label class="file-btn">DICOM folder…<input type="file" id="dicomFolder" webkitdirectory multiple hidden></label>
-      </div>
-      <div id="dropZone" class="drop-zone">or drop a DICOM folder here</div>
-      <label class="field">Series <select id="seriesSelect" disabled></select></label>
-      <div id="volumeInfo" class="info"></div>
-
-      <h3>Display</h3>
-      <label class="field">Window center <input type="range" id="wlCenter"><output id="wlCenterOut"></output></label>
-      <label class="field">Window width <input type="range" id="wlWidth"><output id="wlWidthOut"></output></label>
-      <label class="field">3D transparency threshold <input type="range" id="thr3d" min="0" max="255" value="60"><output id="thr3dOut">60</output></label>
-      <label class="check"><input type="checkbox" id="showSlices3d" checked> Show slices in 3D</label>
-      <label class="check"><input type="checkbox" id="showObliqueIn3d"> Show needle view plane in 3D</label>
-      <label class="field">Patient position (room "up")
-        <select id="roomUp">
-          <option value="0,1,0">Prone (posterior up)</option>
-          <option value="0,-1,0">Supine (anterior up)</option>
-          <option value="-1,0,0">Decubitus left (right side up)</option>
-          <option value="1,0,0">Decubitus right (left side up)</option>
-        </select>
-      </label>
-      <p class="hint">Slice views: click/drag = cursor (or pick), wheel = scroll slice (Alt ×5), Ctrl+wheel = zoom, Shift+drag = pan, right-drag = window/level.</p>
-    </section>
-
-    <section class="tab-panel" data-panel="robot">
-      <h3 id="robotTitle">Robot</h3>
-      <div id="robotDesc" class="info"></div>
-      <h3>Base placement (patient LPS, mm / deg)</h3>
-      <div id="basePoseFields" class="grid3"></div>
-      <div class="row">
-        <button id="placeForTarget">Place robot for target</button>
-        <button id="resetBase">Reset placement</button>
-      </div>
-      <h3>CAD parts</h3>
-      <p class="hint">Load STL/GLB parts exported in the CAD assembly frame at the home configuration (mm). Joint coordinates must match the robot definition file.</p>
-      <label class="field">Body <select id="cadBody"></select></label>
-      <div class="row">
-        <label class="file-btn">Load part…<input type="file" id="cadFile" accept=".stl,.glb,.gltf" hidden></label>
-        <button id="cadClear">Remove part</button>
-      </div>
-      <label class="check"><input type="checkbox" id="showRobot" checked> Show robot</label>
-      <label class="check"><input type="checkbox" id="robotGhost"> Semi-transparent robot</label>
-    </section>
-
-    <section class="tab-panel" data-panel="joints">
-      <h3>Joint control</h3>
-      <div id="jointSliders"></div>
-      <div class="row">
-        <button id="homeBtn">Home</button>
-        <label class="check"><input type="checkbox" id="quantize" checked> Discrete motor steps</label>
-      </div>
-      <label class="field">Motion speed
-        <select id="speed">
-          <option value="1">Real-time</option>
-          <option value="5" selected>×5</option>
-          <option value="25">×25</option>
-          <option value="0">Instant</option>
-        </select>
-      </label>
-      <div id="fkReadout" class="readout"></div>
-    </section>
-
-    <section class="tab-panel" data-panel="cartesian">
-      <h3>Needle tip pose (robot base frame)</h3>
-      <p class="hint">Rotations are about the needle tip. Infeasible commands are rejected; the limiting joints are listed below.</p>
-      <div id="cartSliders"></div>
-      <div id="ikStatus" class="info"></div>
-      <div id="cartReadout" class="readout"></div>
-    </section>
-
-    <section class="tab-panel" data-panel="biopsy">
-      <h3>1 · Target</h3>
-      <div class="row">
-        <button id="pickTarget" class="toggle">Pick target in images</button>
-        <button id="targetFromCursor">Use cursor</button>
-      </div>
-      <div id="lesionButtons" class="row"></div>
-      <div id="targetInfo" class="info"></div>
-
-      <h3>2 · Trajectory</h3>
-      <label class="field">Direction
-        <select id="dirMode">
-          <option value="default">Robot default needle axis</option>
-          <option value="entry">Through entry point</option>
-          <option value="angles">Angles from default axis</option>
-        </select>
-      </label>
-      <div id="entryRow" class="row hidden">
-        <button id="pickEntry" class="toggle">Pick entry point</button>
-      </div>
-      <div id="anglesRow" class="hidden">
-        <label class="field">Azimuth (°) <input type="range" id="azimuth" min="-30" max="30" step="1" value="0"><output id="azimuthOut">0</output></label>
-        <label class="field">Elevation (°) <input type="range" id="elevation" min="-30" max="30" step="1" value="0"><output id="elevationOut">0</output></label>
-      </div>
-      <label class="field">Target at
-        <select id="targetAt">
-          <option value="notch">Specimen notch centre (after firing)</option>
-          <option value="tip">Needle tip</option>
-        </select>
-      </label>
-      <label class="field">Insertion depth
-        <select id="depthMode">
-          <option value="auto">Auto (deepest feasible)</option>
-          <option value="fixed">Fixed</option>
-        </select>
-      </label>
-      <label id="depthRow" class="field hidden">Depth (mm) <input type="number" id="depthValue" value="40" step="1"></label>
-      <div class="row"><button id="planBtn" class="primary">Plan</button></div>
-      <div id="planInfo" class="info"></div>
-
-      <h3>3 · Procedure</h3>
-      <div class="procedure">
-        <button id="alignBtn">Align</button>
-        <button id="insertBtn">Insert</button>
-        <button id="fireBtn">Fire biopsy</button>
-        <button id="retractBtn">Retract</button>
-      </div>
-      <div class="row"><button id="runAllBtn" class="primary">Run all steps</button><button id="resetProcBtn">Reset</button></div>
-      <div id="procInfo" class="info"></div>
-    </section>
-  </aside>
-
   <main class="views">
-    <div id="view3d" class="view3d"></div>
-    <div class="slices">
-      <div id="svAxial"></div>
-      <div id="svCoronal"></div>
-      <div id="svSagittal"></div>
-      <div id="svOblique"></div>
+    <div id="view3d" class="view3d">
+      <!-- Collapsible panels floating over the 3D view. -->
+      <aside class="panels" id="panels">
+        <details class="panel" data-panel="guide" open>
+          <summary>Get started</summary>
+          <div class="panel-body" id="guide"></div>
+        </details>
+
+        <details class="panel" data-panel="scan">
+          <summary>MRI scan</summary>
+          <div class="panel-body">
+            <div class="row">
+              <button id="loadPhantom">Synthetic breast phantom</button>
+            </div>
+            <div class="row">
+              <label class="file-btn">DICOM files…<input type="file" id="dicomFiles" multiple hidden></label>
+              <label class="file-btn">DICOM folder…<input type="file" id="dicomFolder" webkitdirectory multiple hidden></label>
+            </div>
+            <div id="dropZone" class="drop-zone">or drop a DICOM folder here</div>
+            <label class="field">Series <select id="seriesSelect" disabled></select></label>
+            <div id="volumeInfo" class="info"></div>
+            <h3>Display</h3>
+            <label class="field">Window center <input type="range" id="wlCenter"><output id="wlCenterOut"></output></label>
+            <label class="field">Window width <input type="range" id="wlWidth"><output id="wlWidthOut"></output></label>
+            <label class="field">3D transparency threshold <input type="range" id="thr3d" min="0" max="255" value="60"><output id="thr3dOut">60</output></label>
+            <label class="check"><input type="checkbox" id="showSlices3d" checked> Show slices in 3D</label>
+            <label class="check"><input type="checkbox" id="showObliqueIn3d"> Show needle view plane in 3D</label>
+            <label class="field">Patient position (room "up")
+              <select id="roomUp">
+                <option value="0,1,0">Prone (posterior up)</option>
+                <option value="0,-1,0">Supine (anterior up)</option>
+                <option value="-1,0,0">Decubitus left (right side up)</option>
+                <option value="1,0,0">Decubitus right (left side up)</option>
+              </select>
+            </label>
+            <div class="row"><button id="resetVolume">Place scan in front of the robot</button></div>
+          </div>
+        </details>
+
+        <details class="panel" data-panel="robot">
+          <summary>Robot</summary>
+          <div class="panel-body">
+            <label class="field">Robot <select id="robotSelect"></select></label>
+            <div id="robotDesc" class="info"></div>
+            <h3>Base position in the room (mm / deg)</h3>
+            <div id="basePoseFields" class="grid3"></div>
+            <div class="row">
+              <button id="placeForTarget">Place robot for target</button>
+              <button id="resetBase">Reset placement</button>
+            </div>
+            <label class="check"><input type="checkbox" id="showRobot" checked> Show robot</label>
+            <label class="check"><input type="checkbox" id="robotGhost"> Semi-transparent robot</label>
+            <h3>CAD parts</h3>
+            <p class="hint">Load STL/GLB parts exported in the CAD assembly frame at the home configuration (mm).</p>
+            <label class="field">Body <select id="cadBody"></select></label>
+            <div class="row">
+              <label class="file-btn">Load part…<input type="file" id="cadFile" accept=".stl,.glb,.gltf" hidden></label>
+              <button id="cadClear">Remove part</button>
+            </div>
+          </div>
+        </details>
+
+        <details class="panel" data-panel="joints">
+          <summary>Joint control</summary>
+          <div class="panel-body">
+            <div id="jointSliders"></div>
+            <div class="row">
+              <button id="homeBtn">Home</button>
+              <label class="check"><input type="checkbox" id="quantize" checked> Discrete motor steps</label>
+            </div>
+            <label class="field">Motion speed
+              <select id="speed">
+                <option value="1">Real-time</option>
+                <option value="5" selected>×5</option>
+                <option value="25">×25</option>
+                <option value="0">Instant</option>
+              </select>
+            </label>
+            <div id="fkReadout" class="readout"></div>
+          </div>
+        </details>
+
+        <details class="panel" data-panel="cartesian">
+          <summary>End-effector pose</summary>
+          <div class="panel-body">
+            <p class="hint">Needle tip pose in the robot base frame. Rotations are about the needle tip. Unreachable poses are rejected and the limiting joints are listed.</p>
+            <div id="cartSliders"></div>
+            <div id="ikStatus" class="info"></div>
+            <div id="cartReadout" class="readout"></div>
+          </div>
+        </details>
+
+        <details class="panel" data-panel="biopsy">
+          <summary>Biopsy</summary>
+          <div class="panel-body">
+            <h3>1 · Target</h3>
+            <div class="row">
+              <button id="pickTarget" class="toggle">Pick target in slice views</button>
+              <button id="targetFromCursor">Use cursor</button>
+            </div>
+            <div id="lesionButtons" class="row"></div>
+            <div id="targetInfo" class="info"></div>
+
+            <h3>2 · Trajectory</h3>
+            <label class="field">Direction
+              <select id="dirMode">
+                <option value="default">Robot default needle axis</option>
+                <option value="entry">Through entry point</option>
+                <option value="angles">Angles from default axis</option>
+              </select>
+            </label>
+            <div id="entryRow" class="row hidden">
+              <button id="pickEntry" class="toggle">Pick entry point</button>
+            </div>
+            <div id="anglesRow" class="hidden">
+              <label class="field">Azimuth (°) <input type="range" id="azimuth" min="-30" max="30" step="1" value="0"><output id="azimuthOut">0</output></label>
+              <label class="field">Elevation (°) <input type="range" id="elevation" min="-30" max="30" step="1" value="0"><output id="elevationOut">0</output></label>
+            </div>
+            <label class="field">Target at
+              <select id="targetAt">
+                <option value="notch">Specimen notch centre (after firing)</option>
+                <option value="tip">Needle tip</option>
+              </select>
+            </label>
+            <label class="field">Insertion depth
+              <select id="depthMode">
+                <option value="auto">Auto (deepest feasible)</option>
+                <option value="fixed">Fixed</option>
+              </select>
+            </label>
+            <label id="depthRow" class="field hidden">Depth (mm) <input type="number" id="depthValue" value="40" step="1"></label>
+            <div class="row"><button id="planBtn" class="primary">Plan</button></div>
+            <div id="planInfo" class="info"></div>
+
+            <h3>3 · Procedure</h3>
+            <div class="procedure">
+              <button id="alignBtn">Align</button>
+              <button id="insertBtn">Insert</button>
+              <button id="fireBtn">Fire biopsy</button>
+              <button id="retractBtn">Retract</button>
+            </div>
+            <div class="row"><button id="runAllBtn" class="primary">Run all steps</button><button id="resetProcBtn">Reset</button></div>
+            <div id="procInfo" class="info"></div>
+          </div>
+        </details>
+
+        <details class="panel" data-panel="help">
+          <summary>Help</summary>
+          <div class="panel-body hint">
+            <p><b>3D view:</b> left-drag to orbit, right-drag to pan, wheel to zoom. The buttons on the robot and the scan turn on gimbals: drag an arrow to move, a ring to rotate. Esc turns gimbals off.</p>
+            <p><b>Slice views:</b> click/drag sets the cursor (or picks a point), wheel scrolls slices (Alt ×5), Ctrl+wheel zooms, Shift+drag pans, right-drag changes window/level.</p>
+          </div>
+        </details>
+      </aside>
+
+      <!-- Buttons and pop-ups anchored to objects in the 3D scene. -->
+      <div class="overlays" id="overlays"></div>
     </div>
+
+    <section class="slice-dock collapsed hidden" id="sliceDock">
+      <button class="dock-tab" id="dockTab" title="Show or hide the slice views"><span>Slice views</span></button>
+      <div class="slices">
+        <div id="svAxial"></div>
+        <div id="svCoronal"></div>
+        <div id="svSagittal"></div>
+        <div id="svOblique"></div>
+      </div>
+    </section>
   </main>
   <footer id="status" class="status">Ready.</footer>
 
