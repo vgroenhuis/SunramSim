@@ -62,13 +62,13 @@ export class SliceView {
       const line = this.app.needleViewLine();
       const ex = line.dir;
       // Reference: plane containing the needle and the room's vertical, then rotated by the user.
-      let ref = normalize(cross(ex, s.roomUp));
+      let ref = normalize(cross(ex, this.app.upInPatient()));
       if (norm(ref) < 0.5) ref = normalize(cross(ex, [0, 0, 1]));
       const nrm0 = ref;
       const n = mulMV(axisAngle(ex, this.obliqueAngle * Math.PI / 180), nrm0);
       let ey = normalize(cross(n, ex));
       // Keep "up" on screen pointing roughly to the room's up.
-      if (dot(ey, s.roomUp) > 0) ey = scale(ey, -1);
+      if (dot(ey, this.app.upInPatient()) > 0) ey = scale(ey, -1);
       const nn = cross(ex, ey);
       const c0 = add(line.center, scale(nn, this.offset));
       return { c: add(c0, add(scale(ex, this.pan[0]), scale(ey, this.pan[1]))), ex, ey, n: nn };
